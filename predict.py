@@ -164,9 +164,23 @@ def handler(event, context):
 
     spectrograms, cnn_predictions, rnn_predictions = predict(data, num_syl)
 
+    maps = []
+    for Sxx in spectrograms:
+        Sxx = resize_spectrogram(Sxx, (150, 150))
+        x = []
+        y = []
+        z = []
+        for i in range(Sxx.shape[1]):
+            for j in range(Sxx.shape[0]):
+                if Sxx[j][i] > 0.1:
+                    x.append(i)
+                    y.append(150-j)
+                    z.append(float(Sxx[j, i]))
+        maps.append({'x': x, 'y': y, 'z': z})
+
     body = {"cnn_predictions": json.dumps(cnn_predictions),
             "rnn_predictions": json.dumps(rnn_predictions),
-            "spectrograms": json.dumps([Sxx.tolist() for Sxx in spectrograms])}
+            "maps": json.dumps(maps)}
 
     response = {
         "statusCode": 200,
