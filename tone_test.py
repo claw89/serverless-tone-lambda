@@ -1,6 +1,7 @@
 import os
 import json
 import pickle
+import math
 
 try:
   import unzip_requirements
@@ -9,28 +10,60 @@ except ImportError:
 
 import numpy as np
 from scipy import signal
+from scipy.interpolate import interp2d
 
 from tensorflow.keras.models import Model
-from tensorflow.keras.layers import Input, LSTM, Dense, Dropout
+from tensorflow.keras.layers import Input, LSTM, Dense, Dropout, Conv2D, MaxPooling2D, Flatten
+from tensorflow.keras.regularizers import L1L2
 
-def load_model():
-    encoder_inputs = Input(shape=(None, 86))
-    encoder = LSTM(256, activation='relu', return_state=True)
-    encoder_outputs, _, _ = encoder(encoder_inputs)
-    dropout_layer = Dropout(0.5)
-    dropout_output = dropout_layer(encoder_outputs)
-    output_layer = Dense(5, activation='softmax')
-    outputs = output_layer(dropout_output)
+def load_cnn():
+    cnn_inputs = Input(shape=(150, 150, 1))
 
-    model = Model(encoder_inputs, outputs)
-    model.load_weights('/var/task/models/seq_weights')
+    conv2d_1 = Conv2D(32, kernel_size=(3, 3), activation='relu')(cnn_inputs)
+    conv2d_2 = Conv2D(32, kernel_size=(3, 3), activation='relu')(conv2d_1)
+    max_pool_1 = MaxPooling2D(pool_size=(2, 2))(conv2d_2)
+    dropout_1 = Dropout(0.25)(max_pool_1)
+    conv2d_3 = Conv2D(32, kernel_size=(3, 3), activation='relu')(dropout_1)
+    conv2d_4 = Conv2D(32, kernel_size=(3, 3), activation='relu')(conv2d_3)
+    max_pool_2 = MaxPooling2D(pool_size=(2, 2))(conv2d_4)
+    dropout_2 = Dropout(0.25)(max_pool_2)
+    conv2d_5 = Conv2D(32, kernel_size=(3, 3), activation='relu')(dropout_2)
+    conv2d_6 = Conv2D(32, kernel_size=(3, 3), activation='relu')(conv2d_5)
+    max_pool_3 = MaxPooling2D(pool_size=(2, 2))(conv2d_6)
+    dropout_3 = Dropout(0.25)(max_pool_3)
+    flatten = Flatten()(dropout_3)
+    dense = Dense(128, activation='relu')(flatten)
+    cnn_outputs = Dense(4, activation='softmax')(dense)
 
-    return model
+    cnn_model = Model(cnn_inputs, cnn_outputs)
+
+    cnn_model.load_weights('/var/task/models/cnn_weights/cnn_weights')
+
+    return cnn_model
+
+def load_rnn():
+
+    rnn_inputs = Input(shape=(None, 150))
+
+    encoder_1 = LSTM(256,
+                    activation='relu',
+                    return_sequences=True,
+                    kernel_regularizer=L1L2(l1=0.001, l2=0.001))(rnn_inputs)
+    encoder_2 = LSTM(256,
+                    activation='relu',
+                    kernel_regularizer=L1L2(l1=0.001, l2=0.001))(encoder_1)
+    rnn_outputs = Dense(4, activation='softmax')(encoder_2)
+
+    rnn_model = Model(rnn_inputs, rnn_outputs)
+
+    rnn_model.load_weights('/var/task/models/rnn_weights/rnn_weights')
+
+    return rnn_model
 
 def trim_silences(Sxx):
     """
     Removes leading and trailing silence from a spectrogram
-    Silence is defined as a maximum amplitude less than 1% of 
+    Silence is defined as a maximum amplitude less than 1% of
     the overall spectrogram maximum amplitude
     Returns the trimmed spectrogram
     """
@@ -40,21 +73,29 @@ def trim_silences(Sxx):
 
     return Sxx[:, start_id:stop_id]
 
-def split_spectrogram(Sxx):
+def split_spectrogram(Sxx, num_syl):
     """
     Divides the spectrogram of a two sylable word into its component spectrograms
-    Returns a list [Spectrogram for sylable 1, Spectrogram for sylable 2]
     """
-    q1 = Sxx.shape[1]//4
-    q3 = 3*q1
-    center = np.argmin(Sxx[:, q1:q3].max(axis=0))
+    half_search_interval = Sxx.shape[1]//(num_syl*4)
+    split_points = [0]
+    for i in range(1, num_syl):
+        center = i * Sxx.shape[1]//num_syl
+        next_split_point = center - half_search_interval + np.argmin(Sxx[:, center - half_search_interval:center + half_search_interval].max(axis=0))
+        split_points.append(next_split_point)
+    split_points.append(-1)
+    spectrograms = []
+    for i in range(len(split_points) - 1):
+        spectrograms.append(trim_silences(Sxx[:, split_points[i]:split_points[i+1]]))
+    return spectrograms
 
-    return trim_silences(Sxx[:, :q1+center]), trim_silences(Sxx[:, q1+center:])
-
-def spectrogram(data, num_syl):
+def predict(data, num_syl):
     """
     data: a numpy array containing raw audio data
     """
+
+    cnn_model = load_cnn()
+    rnn_model = load_rnn()
 
     spectrograms = []
     shapes = []
@@ -63,42 +104,45 @@ def spectrogram(data, num_syl):
         data = data.T[0]
 
     fs = 44000
-    f, t, Sxx = signal.spectrogram(data, fs, nperseg=1024, nfft=1024*4)
-    Sxx = Sxx[:86]
+    f, t, Sxx = signal.spectrogram(data, fs, nperseg=1024, nfft=1024*4, noverlap=900)
+    Sxx = Sxx[:150]
 
     Sxx = trim_silences(Sxx)
 
-    if num_syl == 1:
+    spectrograms = split_spectrogram(Sxx, num_syl)
+
+    cnn_predictions = []
+    rnn_predictions = []
+
+    for Sxx in spectrograms:
         Sxx = Sxx / np.max(Sxx)
-        Sxx = np.expand_dims(Sxx.T, 0)
-        spectrograms.append(Sxx)
-        shapes.append(json.dumps(Sxx.shape))
+        Sxx = Sxx.T
 
-    elif num_syl == 2:
-        Sxx1, Sxx2 = split_spectrogram(Sxx)
+        cnn_input = np.expand_dims(resize_spectrogram(Sxx, new_size=(150, 150)), -1)
+        cnn_input = np.expand_dims(cnn_input, 0)
 
-        Sxx1 = Sxx1 / np.max(Sxx1)
-        Sxx1 = np.expand_dims(Sxx1.T, 0)
-        spectrograms.append(Sxx1)
-        shapes.append(json.dumps(Sxx1.shape))
+        rnn_input = resize_spectrogram(Sxx, new_size=(150, math.floor(Sxx.shape[1]/7.65)))
+        rnn_input = np.expand_dims(rnn_input, 0)
 
-        Sxx2 = Sxx2 / np.max(Sxx2)
-        Sxx2 = np.expand_dims(Sxx2.T, 0)
-        spectrograms.append(Sxx2)
-        shapes.append(json.dumps(Sxx2.shape))
+        cnn_predictions.append(cnn_model.predict(cnn_input)[0].tolist())
+        rnn_predictions.append(rnn_model.predict(rnn_input)[0].tolist())
 
-    return spectrograms, shapes
+    return spectrograms, cnn_predictions, rnn_predictions
+
+def resize_spectrogram(Sxx, new_size):
+    x = np.linspace(0, Sxx.shape[1]-1, Sxx.shape[1])
+    y = np.linspace(0, Sxx.shape[0]-1, Sxx.shape[0])
+
+    f = interp2d(x, y, Sxx, kind='cubic')
+
+    return f(np.linspace(0, Sxx.shape[1]-1, new_size[0]), np.linspace(0, Sxx.shape[0]-1, new_size[1]))
 
 def handler(event, context):
-    model = load_model()
     with open('/var/task/data.pkl', 'rb') as file:
         data = pickle.load(file)
 
-    spectrograms, shapes = spectrogram(data, 2)
+    spectrograms, cnn_predictions, rnn_predictions = predict(data, 2)
 
-    predictions = []
-    for Sxx in spectrograms:
-        predictions.append(model.predict(Sxx)[0].tolist())
-
-    return {"shapes": shapes,
-            "predictions": predictions}
+    return {"cnn_predictions": json.dumps(cnn_predictions),
+            "rnn_predictions": json.dumps(rnn_predictions),
+            "spectrograms": json.dumps([Sxx.tolist() for Sxx in spectrograms])}
